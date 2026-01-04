@@ -1,0 +1,22 @@
+# Admission Assistant Chatbot - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Web Framework
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+
+# HTTP Client for Ollama API
+requests>=2.31.0
+
+# Document Processing
+python-docx>=1.1.0
+
+# Vector Database
+faiss-cpu>=1.9.0
+
+# Numerical Computing (required by FAISS)
+numpy>=1.26.0
+
+# Data Validation
+pydantic>=2.5.0
+
