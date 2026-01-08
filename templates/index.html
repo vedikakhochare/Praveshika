@@ -50,10 +50,10 @@
         .header {
             background: linear-gradient(135deg, #8B0000 0%, #A52A2A 100%);
             color: white;
-            padding: 25px;
+            padding: 25px 30px;
             text-align: center;
             position: relative;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
         }
 
         .header::before {
@@ -146,6 +146,8 @@
             margin-bottom: 15px;
             display: flex;
             animation: fadeIn 0.3s;
+            align-items: flex-start;
+            gap: 10px;
         }
 
         @keyframes fadeIn {
@@ -159,6 +161,31 @@
 
         .message.bot {
             justify-content: flex-start;
+        }
+
+        .message-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            font-weight: bold;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .message.user .message-avatar {
+            background: linear-gradient(135deg, #8B0000 0%, #A52A2A 100%);
+            color: white;
+            order: 2;
+        }
+
+        .message.bot .message-avatar {
+            background: linear-gradient(135deg, #6c757d 0%, #495057 100%);
+            color: white;
+            order: 0;
         }
 
         .message-content {
@@ -324,6 +351,49 @@
             margin-bottom: 15px;
             border: 1px solid #f5c6cb;
         }
+
+        #clearChatButton {
+            padding: 12px 20px;
+            background: linear-gradient(135deg, #6B0000 0%, #8B0000 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: all 0.3s;
+            box-shadow: 0 2px 6px rgba(139, 0, 0, 0.3);
+            white-space: nowrap;
+            position: relative;
+            overflow: hidden;
+        }
+
+        #clearChatButton::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 30%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.1) 100%);
+            pointer-events: none;
+        }
+
+        #clearChatButton:hover:not(:disabled) {
+            background: linear-gradient(135deg, #7B0000 0%, #9B0000 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(139, 0, 0, 0.4);
+        }
+
+        #clearChatButton:active:not(:disabled) {
+            transform: translateY(0);
+            box-shadow: 0 2px 4px rgba(139, 0, 0, 0.3);
+        }
+
+        #clearChatButton:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 <body>
@@ -350,6 +420,7 @@
         </div>
 
         <div class="input-area">
+            <button id="clearChatButton" onclick="clearChat()" title="Clear Chat">Clear</button>
             <input 
                 type="text" 
                 id="userInput" 
@@ -429,20 +500,66 @@
                     body: JSON.stringify({ question: question })
                 });
 
-                const data = await response.json();
-
                 // Remove loading message
                 const loadingMsg = document.getElementById(loadingId);
                 if (loadingMsg) {
                     loadingMsg.remove();
                 }
 
-                // Add bot response
-                if (response.ok) {
-                    addMessage(data.answer, 'bot');
-                } else {
-                    addMessage(`Error: ${data.detail || 'Unknown error'}`, 'bot');
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }));
+                    addMessage(`Error: ${errorData.detail || 'Unknown error'}`, 'bot');
+                    return;
                 }
+
+                // Create bot message container for streaming
+                const botMessageId = addMessage('', 'bot', false);
+                const botMessageDiv = document.getElementById(botMessageId) || chatArea.lastElementChild;
+                const botContentDiv = botMessageDiv.querySelector('.message-content');
+                
+                // Read streaming response
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let fullAnswer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                if (data.chunk) {
+                                    fullAnswer += data.chunk;
+                                    // Update message content
+                                    botContentDiv.textContent = fullAnswer;
+                                    // Auto-scroll
+                                    chatArea.scrollTop = chatArea.scrollHeight;
+                                }
+                                if (data.done) {
+                                    break;
+                                }
+                            } catch (e) {
+                                // Skip invalid JSON
+                            }
+                        }
+                    }
+                }
+
+                // Final update
+                if (botContentDiv) {
+                    botContentDiv.textContent = fullAnswer || 'No response received.';
+                }
+
+                // Play notification sound when response is complete
+                playNotificationSound();
+
             } catch (error) {
                 // Remove loading message
                 const loadingMsg = document.getElementById(loadingId);
@@ -463,10 +580,18 @@
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${type}`;
             
-            if (isLoading) {
-                const id = 'loading-' + Date.now();
-                messageDiv.id = id;
+            const id = type === 'bot' ? 'bot-' + Date.now() : 'user-' + Date.now();
+            messageDiv.id = id;
+
+            // Create avatar
+            const avatarDiv = document.createElement('div');
+            avatarDiv.className = 'message-avatar';
+            if (type === 'bot') {
+                avatarDiv.textContent = '🎓';
+            } else {
+                avatarDiv.textContent = '👤';
             }
+            messageDiv.appendChild(avatarDiv);
 
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
@@ -481,8 +606,52 @@
             chatArea.appendChild(messageDiv);
             chatArea.scrollTop = chatArea.scrollHeight;
 
-            if (isLoading) {
-                return messageDiv.id;
+            return id;
+        }
+
+        function clearChat() {
+            // Clear all messages from chat area
+            chatArea.innerHTML = '';
+            
+            // Restore welcome message
+            const welcomeMessage = document.createElement('div');
+            welcomeMessage.className = 'welcome-message';
+            welcomeMessage.innerHTML = `
+                <h2>Welcome!</h2>
+                <p>Ask me anything about admissions, eligibility, cutoffs, fees, or the admission process.</p>
+                <p style="margin-top: 10px; font-size: 12px;">I can only answer based on official admission data.</p>
+            `;
+            chatArea.appendChild(welcomeMessage);
+            
+            // Scroll to top
+            chatArea.scrollTop = 0;
+        }
+
+        function playNotificationSound() {
+            // Create a simple notification sound using Web Audio API
+            try {
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+
+                // Set sound properties - pleasant notification tone
+                oscillator.frequency.value = 800; // Frequency in Hz
+                oscillator.type = 'sine'; // Sine wave for smooth tone
+
+                // Set volume envelope (fade in/out)
+                gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+                gainNode.gain.linearRampToValueAtTime(0.3, audioContext.currentTime + 0.01);
+                gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.15);
+
+                // Play the sound
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.15);
+            } catch (error) {
+                // Fallback: try using a simple beep if Web Audio API is not available
+                console.log('Audio notification not available');
             }
         }
 

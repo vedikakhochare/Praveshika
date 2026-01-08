@@ -9,13 +9,14 @@ This module defines the FastAPI application with endpoints for:
 """
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import os
+import json
 from pathlib import Path
 
-from app.config import DATA_DIR
+from app.config import DATA_DIR, TOP_K, TOP_K, SIMILARITY_THRESHOLD
 from app.data_ingestion import load_admission_data, get_available_data_files
 from app.text_chunking import chunk_text
 from app.embeddings import OllamaEmbeddings
@@ -103,22 +104,22 @@ async def root():
         """
 
 
-@app.post("/ask", response_model=QueryResponse)
+@app.post("/ask")
 async def ask_question(request: QueryRequest):
     """
-    Main endpoint for asking questions to the chatbot.
+    Main endpoint for asking questions to the chatbot with streaming support.
     
     This endpoint:
     1. Takes a user question
     2. Uses RAG to retrieve relevant context
-    3. Generates an answer using LLaMA 3.2
-    4. Returns the response
+    3. Streams answer using LLaMA 3.2
+    4. Returns streaming response
     
     Args:
         request: QueryRequest with user question
         
     Returns:
-        QueryResponse with generated answer
+        StreamingResponse with generated answer chunks
     """
     if rag_pipeline is None:
         raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
@@ -126,13 +127,33 @@ async def ask_question(request: QueryRequest):
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     
-    try:
-        answer = rag_pipeline.ask(request.question.strip())
-        return QueryResponse(answer=answer)
-    except ConnectionError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+    def generate():
+        try:
+            # Check if vector store is initialized
+            if rag_pipeline.vector_store.is_empty():
+                yield f"data: {json.dumps({'chunk': 'The admission database is not initialized. Please load admission data first.', 'done': True})}\n\n"
+                return
+            
+            # Retrieve relevant chunks using RAG pipeline's retrieve method
+            chunks = rag_pipeline.retrieve(request.question.strip(), top_k=TOP_K)
+            
+            if not chunks:
+                yield f"data: {json.dumps({'chunk': 'I do not have this information in the official admission data. Please refer to the official college website or contact the admission office.', 'done': True})}\n\n"
+                return
+            
+            # Stream the answer
+            for text_chunk in rag_pipeline.generate_stream(request.question.strip(), chunks):
+                if text_chunk:
+                    yield f"data: {json.dumps({'chunk': text_chunk, 'done': False})}\n\n"
+            
+            yield f"data: {json.dumps({'chunk': '', 'done': True})}\n\n"
+            
+        except ConnectionError as e:
+            yield f"data: {json.dumps({'chunk': f'Error: {str(e)}', 'done': True})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'chunk': f'Error processing query: {str(e)}', 'done': True})}\n\n"
+    
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.post("/load-data")

@@ -9,8 +9,9 @@ This ensures the chatbot only uses information from the admission data,
 preventing hallucinations.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Generator, Tuple
 import requests
+import json
 from app.config import (
     OLLAMA_BASE_URL, LLM_MODEL, TEMPERATURE, MAX_TOKENS, TOP_P,
     SYSTEM_PROMPT, TOP_K, SIMILARITY_THRESHOLD
@@ -41,25 +42,160 @@ class RAGPipeline:
         self.embeddings = embeddings
         self.llm_url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate"
     
+    def _detect_branch_and_admission_type(self, query: str) -> Tuple[Optional[str], bool]:
+        """
+        Detect branch name and admission type (FY/DSY) from query.
+        
+        Args:
+            query: User query
+            
+        Returns:
+            Tuple of (branch_name or None, is_dsy: bool)
+        """
+        query_lower = query.lower()
+        
+        # Detect admission type
+        is_dsy = any(keyword in query_lower for keyword in [
+            'dsy', 'direct second year', 'second year', 'dse', 
+            'lateral entry', 'diploma', 'direct se'
+        ])
+        
+        # Branch name mappings (query patterns -> full branch names)
+        # Order matters - more specific patterns first
+        branch_patterns = [
+            ('artificial intelligence and data science', ['ai&ds', 'ai and ds', 'artificial intelligence and data science', 'aids', 'ai/ds']),
+            ('computer engineering', ['computer engineering', 'computer eng', 'comp eng']),
+            ('information technology', ['information technology', 'it branch', 'it engineering']),
+            ('electronics and telecommunication', ['electronics and telecommunication', 'extc', 'e&tc', 'electronics and telecom'])
+        ]
+        
+        # Also check for shorter patterns but be more careful
+        short_patterns = {
+            'artificial intelligence and data science': ['ai&ds', 'ai and ds'],
+            'computer engineering': ['computer', 'cse'],
+            'information technology': ['it'],
+            'electronics and telecommunication': ['electronics', 'telecommunication', 'etc']
+        }
+        
+        detected_branch = None
+        
+        # First check for specific patterns
+        for branch_name, patterns in branch_patterns:
+            if any(pattern in query_lower for pattern in patterns):
+                detected_branch = branch_name
+                break
+        
+        # If no specific match, check short patterns (but be VERY strict - only if clearly about a branch)
+        if not detected_branch:
+            # Only detect branch from short patterns if:
+            # 1. The pattern appears with explicit branch context (e.g., "computer cutoff", "IT fees")
+            # 2. The query is very short AND contains branch-specific keywords
+            query_words = query_lower.split()
+            for branch_name, patterns in short_patterns.items():
+                for pattern in patterns:
+                    if pattern in query_lower:
+                        # Check if query explicitly mentions branch context
+                        explicit_branch_context = any(phrase in query_lower for phrase in [
+                            f'{pattern} cutoff', f'{pattern} cut-off', f'{pattern} cut off',
+                            f'{pattern} fees', f'{pattern} eligibility', f'{pattern} admission',
+                            f'{pattern} branch', f'{pattern} course', f'for {pattern}',
+                            f'in {pattern}', f'{pattern} for', f'{pattern} in'
+                        ])
+                        
+                        # Only detect if there's explicit branch context
+                        if explicit_branch_context:
+                            detected_branch = branch_name
+                            break
+                if detected_branch:
+                    break
+        
+        return detected_branch, is_dsy
+    
     def retrieve(self, query: str, top_k: int = TOP_K) -> List[str]:
         """
-        Retrieve relevant chunks for a query.
+        Retrieve relevant chunks for a query with branch and admission type filtering.
         
         Args:
             query: User query
             top_k: Number of chunks to retrieve
             
         Returns:
-            List of relevant text chunks
+            List of relevant text chunks filtered by branch and admission type
         """
+        # Detect branch and admission type
+        branch_name, is_dsy = self._detect_branch_and_admission_type(query)
+        
         # Generate query embedding
         query_embedding = self.embeddings.embed_query(query)
         
-        # Search vector store
-        results = self.vector_store.search(query_embedding, k=top_k)
+        # Search vector store (get more results for filtering)
+        results = self.vector_store.search(query_embedding, k=top_k * 3, threshold=0.0)
         
-        # Extract chunks (without similarity scores)
-        chunks = [chunk for chunk, score in results]
+        # Filter chunks based on admission type (FY vs DSY)
+        filtered_chunks = []
+        for chunk, score in results:
+            chunk_lower = chunk.lower()
+            
+            # Admission type filtering
+            if is_dsy:
+                # Only include DSY chunks
+                if not any(kw in chunk_lower for kw in ['direct second year', 'dsy', 'dse', 'diploma', 'second year admission']):
+                    continue
+            else:
+                # Only include FY chunks (exclude DSY chunks)
+                if any(kw in chunk_lower for kw in ['direct second year', 'dsy', 'dse']) and \
+                   not any(kw in chunk_lower for kw in ['first year', 'fy', 'hsc', 'mht-cet', 'jee main']):
+                    continue
+            
+            # Branch filtering (ONLY if branch is explicitly specified)
+            if branch_name:
+                # Check if chunk contains the branch name or related keywords
+                branch_keywords = {
+                    'artificial intelligence and data science': [
+                        'artificial intelligence and data science', 'ai&ds', 'ai and ds', 
+                        'aids', 'branch: artificial intelligence'
+                    ],
+                    'computer engineering': [
+                        'computer engineering', 'branch: computer engineering', 
+                        'computer eng'
+                    ],
+                    'information technology': [
+                        'information technology', 'branch: information technology', 
+                        'it branch'
+                    ],
+                    'electronics and telecommunication': [
+                        'electronics and telecommunication', 'extc', 
+                        'branch: electronics'
+                    ]
+                }
+                
+                keywords = branch_keywords.get(branch_name, [])
+                chunk_mentions_branch = any(kw in chunk_lower for kw in keywords)
+                
+                # If branch is specified, ONLY include chunks that mention that branch
+                # This is strict filtering - if user asked about a specific branch, 
+                # we should only show information about that branch
+                if not chunk_mentions_branch:
+                    continue  # Skip chunks that don't mention the specified branch
+            # If no branch is specified, include all chunks (let LLM provide general info)
+            
+            filtered_chunks.append((chunk, score))
+        
+        # If no filtered chunks, fallback to original results but still apply admission type filter
+        if not filtered_chunks:
+            for chunk, score in results:
+                chunk_lower = chunk.lower()
+                if is_dsy:
+                    if any(kw in chunk_lower for kw in ['direct second year', 'dsy', 'dse', 'diploma', 'second year admission']):
+                        filtered_chunks.append((chunk, score))
+                else:
+                    if not any(kw in chunk_lower for kw in ['direct second year', 'dsy', 'dse']) or \
+                       any(kw in chunk_lower for kw in ['first year', 'fy', 'hsc', 'mht-cet', 'jee main']):
+                        filtered_chunks.append((chunk, score))
+        
+        # Sort by similarity and return top_k
+        filtered_chunks.sort(key=lambda x: x[1], reverse=True)
+        chunks = [chunk for chunk, score in filtered_chunks[:top_k]]
         
         return chunks
     
@@ -97,6 +233,58 @@ class RAGPipeline:
             response.raise_for_status()
             result = response.json()
             return result.get("response", "").strip()
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(
+                f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
+                "Please ensure Ollama is running and the model is installed:\n"
+                f"  ollama pull {LLM_MODEL}"
+            )
+        except requests.exceptions.RequestException as e:
+            raise requests.RequestException(f"Error generating response: {str(e)}")
+    
+    def generate_stream(self, query: str, context_chunks: List[str]):
+        """
+        Generate answer using LLM with streaming support.
+        
+        Args:
+            query: User query
+            context_chunks: Retrieved relevant chunks
+            
+        Yields:
+            Text chunks as they are generated
+        """
+        # Combine chunks into context
+        context = "\n\n".join(context_chunks)
+        
+        # Format prompt
+        prompt = SYSTEM_PROMPT.format(context=context, question=query)
+        
+        # Prepare LLM request with streaming
+        payload = {
+            "model": LLM_MODEL,
+            "prompt": prompt,
+            "stream": True,
+            "options": {
+                "temperature": TEMPERATURE,
+                "num_predict": MAX_TOKENS,
+                "top_p": TOP_P
+            }
+        }
+        
+        try:
+            response = requests.post(self.llm_url, json=payload, stream=True, timeout=60)
+            response.raise_for_status()
+            
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        json_data = json.loads(line)
+                        if "response" in json_data:
+                            yield json_data["response"]
+                        if json_data.get("done", False):
+                            break
+                    except json.JSONDecodeError:
+                        continue
         except requests.exceptions.ConnectionError:
             raise ConnectionError(
                 f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
